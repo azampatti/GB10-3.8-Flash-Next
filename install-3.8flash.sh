@@ -104,7 +104,7 @@ done
 ok "4 patch files in $WORK"
 
 # ---- 5. FP8 dense cast ----------------------------------------------------
-step "Now applying the FP8 dense-cast patch..."
+step "Now applying the runtime patches (FP8 cast, PLE-off mode)..."
 cat > "$WORK/patch_fp8.py" <<'Q4XEOF'
 #!/usr/bin/env python3
 """Step 1: post-load FP8 cast for lm_head (and, later, other dense modules).
@@ -360,7 +360,132 @@ if __name__ == "__main__":
 Q4XEOF
 Q4X_TARGET="$REPO/patches/qwen4_exp_nvfp4.py" python3 "$WORK/patch_fp8.py" \
   || die "FP8 patch failed to apply"
-ok "256 modules will be cast at load time"
+cat > "$WORK/patch_ple_off.py" <<'PLEEOF'
+#!/usr/bin/env python3
+"""Step 2: PLE_MODE=off -- drop the n-gram table entirely.
+
+Anchored edit against flashnext-one-spark/patches/qwen4_exp_nvfp4.py, mirroring
+the existing hashk path (which already deletes the embedding parameter, so the
+mechanism is proven -- we only add "and load nothing in its place").
+
+Three hooks:
+  1. __init__      delete the weight parameter, flag the module
+  2. gather        return zeros instead of looking anything up
+  3. weight loader consume + discard the 10 model-plefp8-* shards, never allocate
+
+The injection is `hidden_states = hidden_states + self.ple(...)`, so zeros make it
+an exact no-op. RMSNorm(0) = 0/sqrt(eps) = 0, no NaN.
+
+Frees 12.8 GB vs hashk (51.2 GB vs an unmodified checkpoint).
+
+  --check   write to a temp copy and validate only; do NOT touch the live file
+"""
+import argparse, ast, os, pathlib, shutil, sys
+
+TARGET = pathlib.Path(os.environ["Q4X_TARGET"])
+
+HELPER = '''
+
+def _ple_off() -> bool:
+    """PLE_MODE=off: no n-gram table at all. Not a speed lever -- the table is
+    ~5 KB/token -- but it frees 12.8 GB and answers what the table is worth."""
+    import os
+
+    return os.environ.get("SGLANG_QWEN4_PLE_OFF", "0") == "1"
+
+'''
+HELPER_ANCHOR = "\ndef _nvfp4_ple_enabled() -> bool:"
+
+INIT_ANCHOR = """        if _hashk_path():
+            if getattr(config, "ple_offload_embedding", False):
+                config.ple_offload_embedding = False"""
+INIT_NEW = """        if _ple_off():
+            if getattr(config, "ple_offload_embedding", False):
+                config.ple_offload_embedding = False
+            del self.ngram_embedding._parameters["weight"]
+            torch.cuda.empty_cache()
+            self.ngram_embedding.ple_off = True
+            logger.info(
+                "PLE OFF: n-gram embedding deleted, injection zeroed "
+                "(frees 12.8 GB vs hashk, 51.2 GB vs the raw checkpoint)"
+            )
+        elif _hashk_path():
+            if getattr(config, "ple_offload_embedding", False):
+                config.ple_offload_embedding = False"""
+
+GATHER_ANCHOR = """        if getattr(self.ngram_embedding, "hashk_mode", False):
+            embeddings = _hashk_gather(self.ngram_embedding, lookup_ids)"""
+GATHER_NEW = """        if getattr(self.ngram_embedding, "ple_off", False):
+            # [T, heads] -> [T, heads, head_dim] of zeros. The PLE output is added
+            # to the residual stream, so zeros make the whole injection a no-op.
+            embeddings = torch.zeros(
+                (*lookup_ids.shape, self.head_dim_per_ngram),
+                dtype=torch.bfloat16,
+                device=lookup_ids.device,
+            )
+        elif getattr(self.ngram_embedding, "hashk_mode", False):
+            embeddings = _hashk_gather(self.ngram_embedding, lookup_ids)"""
+
+LOADER_ANCHOR = """            if getattr(emb, "hashk_mode", False):
+                loaded_shard_params.add(f"{mod_prefix}.ngram_embedding.weight")
+                return True"""
+LOADER_NEW = """            if getattr(emb, "ple_off", False) or getattr(emb, "hashk_mode", False):
+                # Consume and discard: the 10 model-plefp8-* shards are read off
+                # disk and dropped, never allocated.
+                loaded_shard_params.add(f"{mod_prefix}.ngram_embedding.weight")
+                return True"""
+
+EDITS = [("helper", HELPER_ANCHOR, HELPER + HELPER_ANCHOR),
+         ("init", INIT_ANCHOR, INIT_NEW),
+         ("gather", GATHER_ANCHOR, GATHER_NEW),
+         ("loader", LOADER_ANCHOR, LOADER_NEW)]
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--check", action="store_true",
+                    help="validate against a temp copy; leave the live file alone")
+    args = ap.parse_args()
+
+    src = TARGET.read_text()
+    if "_ple_off" in src:
+        print("already patched; nothing to do")
+        return 0
+
+    out = src
+    for name, anchor, repl in EDITS:
+        if anchor not in out:
+            print(f"FATAL: anchor {name!r} not found -- refusing to guess", file=sys.stderr)
+            return 1
+        out = out.replace(anchor, repl, 1)
+        print(f"  applied: {name}")
+
+    ast.parse(out)
+    print("syntax OK")
+
+    if args.check:
+        tmp = pathlib.Path("/tmp/qwen4_exp_ple_off_preview.py")
+        tmp.write_text(out)
+        print(f"--check: wrote preview to {tmp} (+{len(out) - len(src)} bytes)")
+        print("LIVE FILE UNTOUCHED -- rerun without --check when the server is down")
+        return 0
+
+    backup = TARGET.with_suffix(".py.prestep2")
+    if not backup.exists():
+        shutil.copy2(TARGET, backup)
+        print(f"backup -> {backup.name}")
+    TARGET.write_text(out)
+    print(f"patched {TARGET.name}: +{len(out) - len(src)} bytes")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+PLEEOF
+Q4X_TARGET="$REPO/patches/qwen4_exp_nvfp4.py" python3 "$WORK/patch_ple_off.py" \
+  || die "PLE-off patch failed to apply"
+ok "FP8 cast + PLE-off mode available"
 
 # ---- 6. HashK R=4 artifact ------------------------------------------------
 if [ ! -f "$REPO/ple_hashk_R4.pt" ]; then
@@ -388,11 +513,34 @@ HF_CACHE="@@HF_CACHE@@"
 IMAGE="@@IMAGE@@"
 MODEL_ID="@@MODEL_ID@@"
 PORT="${PORT:-30000}"
-CTX="${CTX:-200000}"
 MEM_FRACTION="${MEM_FRACTION:-0.90}"
 THINKING="${THINKING:-medium}"
 
-[ -f "$REPO/ple_hashk_R4.pt" ] || { echo "HashK artifact missing -- re-run install-3.8flash.sh" >&2; exit 1; }
+# ---- mode -----------------------------------------------------------------
+#   1  n-gram table at HashK R=4, 200k context   (default; best measured quality)
+#   2  no n-gram table, 256k context             (8.6x the KV cache, ~2 pts lower
+#                                                 on tool-eval -- within run noise)
+MODE="${MODE:-}"
+if [ -z "$MODE" ]; then
+  if [ -t 0 ]; then
+    echo "  Which configuration?"
+    echo "    1) R=4 n-gram table  --  200k context   (default, best quality)"
+    echo "    2) PLE OFF           --  256k context, 4+ concurrent long sessions"
+    printf "  Choose [1]: "; read -r MODE
+  fi
+  MODE="${MODE:-1}"
+fi
+
+case "$MODE" in
+  1) PLE_ENV=(-e "SGLANG_QWEN4_PLE_HASHK=/patches/ple_hashk_R4.pt")
+     CTX="${CTX:-200000}"
+     [ -f "$REPO/ple_hashk_R4.pt" ] || { echo "HashK artifact missing -- re-run install-3.8flash.sh" >&2; exit 1; }
+     echo "  mode 1: HashK R=4 table, ${CTX} context" ;;
+  2) PLE_ENV=(-e "SGLANG_QWEN4_PLE_OFF=1")
+     CTX="${CTX:-256000}"
+     echo "  mode 2: PLE OFF (no n-gram table), ${CTX} context" ;;
+  *) echo "unknown MODE=$MODE (use 1 or 2)" >&2; exit 1 ;;
+esac
 
 # ---- memory advisory ------------------------------------------------------
 # Reference: on the box this was tuned on, with nothing else loaded, there was
@@ -439,7 +587,7 @@ docker run -d --name flashnext --privileged --gpus all --network host --ipc=host
   -v "$REPO/patches/flash_fwd.py":/usr/local/lib/python3.12/dist-packages/flash_attn/cute/flash_fwd.py:ro \
   -v "$REPO/patches/qwen_sparse_attn_backend.py":/sgl-workspace/sglang/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py:ro \
   -v "$REPO/patches/sparse_attn.py":/sgl-workspace/sglang/python/sglang/srt/layers/attention/qsa/sparse_attn.py:ro \
-  -e "SGLANG_QWEN4_PLE_HASHK=/patches/ple_hashk_R4.pt" \
+  "${PLE_ENV[@]}" \
   -e "Q4X_FP8=lm_head,linear_attn,qkv_proj,o_proj,shared_expert" \
   "$IMAGE" \
   python3 -m sglang.launch_server \
