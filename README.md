@@ -3,6 +3,8 @@
 A 180B model that officially needs two DGX Sparks, running on one — at **~43 tok/s**
 with **91/100** on tool-eval-bench.
 
+One Liner: **curl -fsSL https://raw.githubusercontent.com/azampatti/GB10-3.8-Flash-Next/main/install-3.8flash.sh | bash && ~/launch-3.8flash.sh**
+
 | workload | tok/s |
 |---|---:|
 | Q&A | 35.2 |
@@ -13,7 +15,6 @@ with **91/100** on tool-eval-bench.
 
 *Single stream, 200k context. `sgbench` Run 2/2 on a GB10 DGX Spark.*
 
-One Liner: **curl -fsSL https://raw.githubusercontent.com/azampatti/GB10-3.8-Flash-Next/main/install-3.8flash.sh | bash && ~/launch-3.8flash.sh**
 ---
 
 ## Requirements
