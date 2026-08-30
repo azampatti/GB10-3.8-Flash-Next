@@ -1,6 +1,6 @@
 # GB10-3.8-Flash-Next
 
-A 180B model that officially needs two DGX Sparks, running on one — at **~40 tok/s**
+A 180B model that officially needs two DGX Sparks, running on one — at **~43 tok/s**
 with **91/100** on tool-eval-bench.
 
 | workload | tok/s |
@@ -8,8 +8,8 @@ with **91/100** on tool-eval-bench.
 | Q&A | 35.2 |
 | Code | 38.4 |
 | JSON | 43.9 |
-| Math | 40.7 |
-| LongCode | 42.6 |
+| Math | 42.7 |
+| LongCode | 43.6 |
 
 *Single stream, 200k context. `sgbench` Run 2/2 on a GB10 DGX Spark.*
 
